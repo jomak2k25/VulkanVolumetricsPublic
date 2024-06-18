@@ -1,0 +1,87 @@
+// This Compute Shader marches through a 3D map of the fog in the scene and combines
+// the values into a 2D texture ouput which can be layed over the final render
+#version 450
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+// General Info on the volumetrics
+layout (set = 0, binding = 0) uniform readonly VolumetricsInfo
+{
+	vec3 Albedo;
+	float InitialStepSize;
+	float StepFallOff;
+	float LightStepSize;
+	float Near;
+	float Far;
+	float Absorption;
+	float Density;
+	float AbsorptionCutoff;
+	float LightAbsorptionCutoff;
+	float NoiseXTile;
+	float NoiseYTile;
+	float NoiseZTile;
+	float NoiseXOffset;
+	float NoiseYOffset;
+	float NoiseZOffset;
+	float NoiseFactor;
+	float SmoothFactor;
+	uint MapHeight;
+	uint MapWidth;
+	uint MapDepth;
+}Volumetrics;
+
+layout (set = 0, binding = 1, rgba8) uniform readonly image3D InputTexture3D;
+
+layout (set = 0, binding = 2, rgba8) uniform writeonly image2D OutputTexture2D;
+
+// Beer Lambert Equation used to exponentially reduce visibility based on the Absorption coefficient,
+// Density and distance covered.
+float BeerLambert(float AbsorptionCoefficient, float Density, float dist)
+{
+	return exp(-(AbsorptionCoefficient * Density * dist));
+}
+
+void main ()
+{
+	//  Make sure we don't access past the buffer size
+	if(gl_GlobalInvocationID.x >= Volumetrics.MapWidth || gl_GlobalInvocationID.y >= Volumetrics.MapHeight)
+	{
+		return;
+	}
+
+	// Initialise the Output Colour to blank
+	vec4 OutputColour = vec4(0.0);
+
+	int SampleDepth = 0;
+	// Default this as 1 so the original colour is fully visible by default
+	float Visibility = 1.0f;
+
+	// March the ray until it hits the fragment position or the far clip camera distance
+	while(SampleDepth < Volumetrics.MapDepth && Visibility > Volumetrics.AbsorptionCutoff)
+	{
+		// Retrieve the value from this depth from the 3D Texture Map input
+		vec4 SampledColour = imageLoad(InputTexture3D, ivec3(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y, SampleDepth));
+
+		// Check there is a density value at this position in the map
+		if(SampledColour.w > 0.f)
+		{
+			float PreviousVisibility = Visibility;
+			if(Volumetrics.StepFallOff == 0.0f)
+			{
+				Visibility *= BeerLambert(Volumetrics.Absorption, SampledColour.w, Volumetrics.InitialStepSize); 
+			}
+			else
+			{
+				Visibility *= BeerLambert(Volumetrics.Absorption, SampledColour.w, Volumetrics.InitialStepSize + (SampleDepth * Volumetrics.StepFallOff)); 
+			}
+			float AbsorptionFromMarch = PreviousVisibility - Visibility;
+
+			// Add this fog colour into the final output colour
+			OutputColour += AbsorptionFromMarch * SampledColour;
+		}
+		// Step the sample depth along the map
+		++SampleDepth;
+	}
+
+	imageStore(OutputTexture2D, ivec2(gl_GlobalInvocationID.xy), OutputColour);
+}

@@ -1,0 +1,245 @@
+// compute shader for building a 3D texture map of the volumetric fog in the scene
+// This will more evenly distribute the work of sampling the fog and calculating in-scattering across the GPU
+
+#version 450
+
+layout (local_size_x = 8, local_size_y  = 8, local_size_z  = 8) in;
+
+// Pass in lighting info so we can calculate in-scattering
+struct Light {
+	vec4 position;
+	vec3 color; 
+	float radius;
+};
+
+layout (set = 0, binding = 0) uniform readonly SceneInfo 
+{
+	Light lights[6];
+	vec4 viewPos;
+	int displayDebugTarget;
+	int lightCount;
+}Scene;
+
+// Structure defining a sphere
+struct SphereInfo
+{
+	vec3 Pos;
+	float Radius;
+};
+
+// Buffer to define the shapes and locations of the fog in world-space
+layout (set = 0, binding = 1) uniform readonly FogShapes
+{
+	SphereInfo Spheres[3];
+	int SphereCount;
+}SceneFog;
+
+// General Info on the volumetrics
+layout (set = 0, binding = 2) uniform readonly VolumetricsInfo
+{
+vec3 Albedo;
+float InitialStepSize;
+float StepFallOff;
+float LightStepSize;
+float Near;
+float Far;
+float Absorption;
+float Density;
+float AbsorptionCutoff;
+float LightAbsorptionCutoff;
+float NoiseXTile;
+float NoiseYTile;
+float NoiseZTile;
+float NoiseXOffset;
+float NoiseYOffset;
+float NoiseZOffset;
+float NoiseFactor;
+float SmoothFactor;
+uint MapHeight;
+uint MapWidth;
+uint MapDepth;
+}Volumetrics;
+
+// Sampler for the prebaked perlin noise texture
+layout (set = 0, binding = 3) uniform sampler2D PerlinSampler;
+
+// Sampler for worldspace position G-Buffer, needed to calculate rays
+layout (set = 0, binding = 4) uniform sampler2D PositionSampler;
+
+// 3D texture map output
+layout (set = 0, binding = 5, rgba8) uniform writeonly image3D OutputTexture;
+
+// Beer Lambert Equation used to exponentially reduce visibility based on the Absorption coefficient,
+// Density and distance covered.
+float BeerLambert(float AbsorptionCoefficient, float Density, float dist)
+{
+	return exp(-(AbsorptionCoefficient * Density * dist));
+}
+
+// Modified From https://iquilezles.org/articles/distfunctions
+// Returns the distance to the sphere
+// Negative = Within The Sphere, Positive = Outside of the sphere
+float sdSphere(vec3 Pos, vec3 Origin, float Radius)
+{
+	Pos = Pos - Origin;
+	return length(Pos)-Radius;
+}
+
+// Taken from https://iquilezles.org/articles/distfunctions
+float opSmoothUnion( float d1, float d2, float k ) 
+{
+    float h = clamp( 0.5 + 0.5*(d2-d1)/k, 0.0, 1.0 );
+    return mix( d2, d1, h ) - k*h*(1.0-h); 
+}
+
+// Query the density by checking if the sample position is within the volume and return
+// the density at that point
+float QueryDensity(vec3 Pos)
+{
+	Pos = -Pos;
+	// Generate a Noise Sampling UV vector
+	vec3 samplingPos = Pos;
+	samplingPos[0] += Volumetrics.NoiseXOffset;
+	samplingPos[1] -= Volumetrics.NoiseYOffset;
+	samplingPos[2] -= Volumetrics.NoiseZOffset;
+
+	samplingPos.x /= Volumetrics.NoiseXTile;
+	samplingPos.y /=  Volumetrics.NoiseYTile;
+	samplingPos.z /=  Volumetrics.NoiseZTile;
+
+	// Calculate the noise using the sampled values and noise factor multiplier
+	float NoiseValue = clamp(length(texture(PerlinSampler,samplingPos.zy).xyz),0.f, 1.f) 
+	* clamp(length(texture(PerlinSampler,samplingPos.xz).xyz),0.f, 1.f) 
+	* clamp(length(texture(PerlinSampler,samplingPos.xy).xyz),0.f, 1.f)
+	* Volumetrics.NoiseFactor; 
+	NoiseValue -= NoiseValue/2;
+
+	// Sample the distance from the spheres
+	float SDFValue = sdSphere(Pos, SceneFog.Spheres[0].Pos, SceneFog.Spheres[0].Radius);
+	for(int i = 1; i < SceneFog.SphereCount; ++i)
+	{
+		SDFValue = opSmoothUnion(SDFValue, sdSphere(Pos, SceneFog.Spheres[i].Pos, SceneFog.Spheres[i].Radius), Volumetrics.SmoothFactor);
+	}
+	// Adjust with the noise value
+	SDFValue += NoiseValue;
+
+	if(SDFValue <= 0.f)
+	{
+		return Volumetrics.Density;
+	}
+	else
+	{
+		return 0.f;
+	}
+}
+
+// March from the sample point to a light source and calculate how visible the light should be to this point in the 
+// volume
+float CalculateLightVisibility(const vec3 RayOrigin,const vec3 RayDirection, float RayLength)
+{
+    float RayDepth = 0.0f;
+    float Visibility = 1.0f;
+
+	// March along the ray until the full length of the ray has been sampled or
+	// the absorption cutoff has been reached
+    while(RayDepth < RayLength && Visibility > Volumetrics.LightAbsorptionCutoff)
+	{                       
+		// Calculate the Sample Position
+        vec3 SamplePos = RayOrigin + RayDepth * RayDirection;
+
+		// Query the fog density at our sample position
+        float Density = QueryDensity(SamplePos);
+		// If their is fog density at this point, reduce the visibility of the light
+        if(Density > 0)
+        {
+            Visibility *= BeerLambert(Volumetrics.Absorption, Density, Volumetrics.LightStepSize);
+        }
+		// March further along the ray
+        RayDepth += Volumetrics.LightStepSize;
+    }
+    return Visibility;
+}
+
+void main ()
+{
+	//  Make sure we don't try and sample fog from outside bounds of the 3D map
+	if(gl_GlobalInvocationID.x >= Volumetrics.MapWidth ||
+	gl_GlobalInvocationID.y >= Volumetrics.MapWidth ||
+	gl_GlobalInvocationID.z >= Volumetrics.MapDepth)
+		return;
+
+	vec4 OutputColour = vec4(0, 0, 0, 0);
+
+	// Calculate the Sample Position within the 3D map
+	
+	// Get G-Buffer world space position of the fragment behind the map at this XY coordinate
+	const vec3 RayTarget = texture(PositionSampler, vec2(float(gl_GlobalInvocationID.x)/float(Volumetrics.MapWidth), float(gl_GlobalInvocationID.y)/float(Volumetrics.MapHeight))).rgb;
+	// The ray starts at the camera position
+	const vec3 RayStartPos = Scene.viewPos.xyz; 
+
+	// Entire Ray from camera to fragment
+	const vec3 Ray = RayTarget - Scene.viewPos.xyz; 
+	// Attain the length of the entire array
+	const float RayLength = length(Ray);  // Length of the ray
+
+
+	float SampleDepth;
+	if(Volumetrics.StepFallOff == 0.0f)
+	{
+		SampleDepth = (gl_GlobalInvocationID.z * Volumetrics.InitialStepSize) + Volumetrics.Near;
+	}
+	else
+	{
+		SampleDepth = (Volumetrics.InitialStepSize * gl_GlobalInvocationID.z) + ((Volumetrics.StepFallOff * pow(gl_GlobalInvocationID.z, 2))/2);
+	}
+
+	// Return if this map voxel's depth is beyond the length of the ray
+	if(SampleDepth > RayLength || SampleDepth > Volumetrics.Far || RayTarget == vec3(0,0,0))
+	{
+		imageStore(OutputTexture, ivec3(gl_GlobalInvocationID.xyz), OutputColour);
+		return;
+	}
+		
+	// Attain the normalized direction of the ray
+	const vec3 RayDirection = normalize(Ray); // Direction of the ray
+	
+	vec3 SamplePos = RayStartPos + (RayDirection * SampleDepth);
+	//Sample the fog and calculate lighting at the sample position
+
+	float SampledDensity = QueryDensity(SamplePos);
+
+	// Initialise the output colour to have the sampled density as the alpha value
+	OutputColour.w = SampledDensity;
+
+	if(SampledDensity <= 0.f)
+	{
+		imageStore(OutputTexture, ivec3(gl_GlobalInvocationID.xyz), OutputColour);
+		return;
+	}
+		
+	// Calculate the lit colour of the fog by marching to all lights in range
+	for(int i = 0; i < Scene.lightCount; ++i)
+	{
+		// Vector to light
+		const vec3 PosToLight = Scene.lights[i].position.xyz - SamplePos;
+		// Distance from light to fragment position
+		const float LightDist = length(PosToLight);
+		if(LightDist < Scene.lights[i].radius)
+		{
+			// Attenuation
+			float Attenuation = Scene.lights[i].radius / (pow(LightDist, 2.0) + 1.0);
+
+			// Get the colour of the light affected by the Attenuation
+			vec3 LightColor = Scene.lights[i].color * Attenuation;
+
+			const vec3 LightDir = normalize(PosToLight);
+
+			// Calculate the Visibility of the light by marching towards the light from the sample position
+            float LightVisibility = CalculateLightVisibility(SamplePos, LightDir, LightDist); 
+            OutputColour.xyz += LightVisibility * Volumetrics.Albedo * LightColor;
+		}
+	}
+
+	imageStore(OutputTexture, ivec3(gl_GlobalInvocationID.xyz), OutputColour);
+
+}
